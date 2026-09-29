@@ -1,151 +1,109 @@
 #include <cuda_runtime.h>
-
-#include <cstdio>
-#include <cstdlib>
-#include <fstream>
+#include <opencv2/opencv.hpp>
 #include <iostream>
-#include <string>
-#include <vector>
 
-__global__ void processImage(const unsigned char* input,
-                             unsigned char* output,
-                             int width,
-                             int height) {
+using namespace cv;
+using namespace std;
+
+__global__ void rgbToGrayscale(const uchar3 *input, unsigned char *output,
+                               int width, int height)
+{
     int x = blockIdx.x * blockDim.x + threadIdx.x;
     int y = blockIdx.y * blockDim.y + threadIdx.y;
 
-    if (x >= width || y >= height) {
-        return;
+    if (x < width && y < height)
+    {
+        int idx = y * width + x;
+
+        uchar3 pixel = input[idx];
+
+        output[idx] = static_cast<unsigned char>(
+            0.299f * pixel.x +
+            0.587f * pixel.y +
+            0.114f * pixel.z
+        );
     }
-
-    int index = (y * width + x) * 3;
-
-    unsigned char r = input[index];
-    unsigned char g = input[index + 1];
-    unsigned char b = input[index + 2];
-
-    unsigned char gray =
-        static_cast<unsigned char>(
-            (static_cast<int>(r) +
-             static_cast<int>(g) +
-             static_cast<int>(b)) / 3);
-
-    output[index] = gray;
-    output[index + 1] = gray;
-    output[index + 2] = gray;
 }
 
-void savePPM(const std::string& filename,
-             const std::vector<unsigned char>& image,
-             int width,
-             int height) {
-    std::ofstream file(filename, std::ios::binary);
+int main()
+{
+    Mat input = imread("data/Lena.png", IMREAD_COLOR);
 
-    file << "P6\n" << width << " " << height << "\n255\n";
-    file.write(reinterpret_cast<const char*>(image.data()),
-               image.size());
-}
-
-int main(int argc, char* argv[]) {
-    int imageCount = 100;
-    int width = 256;
-    int height = 256;
-
-    if (argc > 1) {
-        imageCount = std::atoi(argv[1]);
-    }
-
-    if (argc > 2) {
-        width = std::atoi(argv[2]);
-    }
-
-    if (argc > 3) {
-        height = std::atoi(argv[3]);
-    }
-
-    if (imageCount <= 0 || width <= 0 || height <= 0) {
-        std::cerr << "Usage: " << argv[0]
-                  << " [image_count] [width] [height]\n";
+    if (input.empty())
+    {
+        cerr << "Error: Could not load data/Lena.png" << endl;
         return 1;
     }
 
-    size_t imageSize =
-        static_cast<size_t>(width) * height * 3;
+    int width = input.cols;
+    int height = input.rows;
+    size_t numPixels = static_cast<size_t>(width) * height;
 
-    std::vector<unsigned char> hostInput(imageSize);
-    std::vector<unsigned char> hostOutput(imageSize);
+    cout << "CUDA Image Processing Project" << endl;
+    cout << "Input image: Lena.png" << endl;
+    cout << "Image size: " << width << " x " << height << endl;
 
-    unsigned char* deviceInput = nullptr;
-    unsigned char* deviceOutput = nullptr;
+    uchar3 *d_input = nullptr;
+    unsigned char *d_output = nullptr;
 
-    cudaMalloc(&deviceInput, imageSize);
-    cudaMalloc(&deviceOutput, imageSize);
+    cudaMalloc(&d_input, numPixels * sizeof(uchar3));
+    cudaMalloc(&d_output, numPixels * sizeof(unsigned char));
 
-    dim3 threads(16, 16);
-    dim3 blocks(
-        (width + threads.x - 1) / threads.x,
-        (height + threads.y - 1) / threads.y);
+    cudaMemcpy(
+        d_input,
+        input.ptr<uchar3>(),
+        numPixels * sizeof(uchar3),
+        cudaMemcpyHostToDevice
+    );
 
-    std::cout << "CUDA Batch Image Processing\n";
-    std::cout << "Images: " << imageCount << "\n";
-    std::cout << "Resolution: "
-              << width << "x" << height << "\n";
-    std::cout << "GPU kernel: RGB to grayscale\n";
+    dim3 blockSize(16, 16);
+    dim3 gridSize(
+        (width + blockSize.x - 1) / blockSize.x,
+        (height + blockSize.y - 1) / blockSize.y
+    );
 
-    for (int image = 0; image < imageCount; ++image) {
-        for (size_t i = 0; i < imageSize; i += 3) {
-            hostInput[i] =
-                static_cast<unsigned char>((i + image * 17) % 256);
-            hostInput[i + 1] =
-                static_cast<unsigned char>((i / 2 + image * 31) % 256);
-            hostInput[i + 2] =
-                static_cast<unsigned char>((i / 3 + image * 47) % 256);
-        }
+    rgbToGrayscale<<<gridSize, blockSize>>>(
+        d_input,
+        d_output,
+        width,
+        height
+    );
 
-        cudaMemcpy(deviceInput,
-                   hostInput.data(),
-                   imageSize,
-                   cudaMemcpyHostToDevice);
+    cudaError_t error = cudaGetLastError();
 
-        processImage<<<blocks, threads>>>(
-            deviceInput,
-            deviceOutput,
-            width,
-            height);
-
-        cudaError_t error = cudaGetLastError();
-
-        if (error != cudaSuccess) {
-            std::cerr << "Kernel error: "
-                      << cudaGetErrorString(error) << "\n";
-            cudaFree(deviceInput);
-            cudaFree(deviceOutput);
-            return 1;
-        }
-
-        cudaDeviceSynchronize();
-
-        cudaMemcpy(hostOutput.data(),
-                   deviceOutput,
-                   imageSize,
-                   cudaMemcpyDeviceToHost);
-
-        std::string filename =
-            "data/output_" + std::to_string(image) + ".ppm";
-
-        savePPM(filename, hostOutput, width, height);
-
-        if ((image + 1) % 10 == 0) {
-            std::cout << "Processed "
-                      << image + 1 << "/"
-                      << imageCount << " images\n";
-        }
+    if (error != cudaSuccess)
+    {
+        cerr << "CUDA kernel launch failed: "
+             << cudaGetErrorString(error) << endl;
+        cudaFree(d_input);
+        cudaFree(d_output);
+        return 1;
     }
 
-    cudaFree(deviceInput);
-    cudaFree(deviceOutput);
+    cudaDeviceSynchronize();
 
-    std::cout << "Processing completed successfully.\n";
+    Mat output(height, width, CV_8UC1);
+
+    cudaMemcpy(
+        output.data,
+        d_output,
+        numPixels * sizeof(unsigned char),
+        cudaMemcpyDeviceToHost
+    );
+
+    if (!imwrite("bin/lena_grayscale.png", output))
+    {
+        cerr << "Error: Could not save output image." << endl;
+        cudaFree(d_input);
+        cudaFree(d_output);
+        return 1;
+    }
+
+    cout << "CUDA grayscale processing completed successfully." << endl;
+    cout << "Output: bin/lena_grayscale.png" << endl;
+
+    cudaFree(d_input);
+    cudaFree(d_output);
 
     return 0;
 }
